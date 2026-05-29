@@ -1,0 +1,97 @@
+[project]
+name = "execlave-sdk"
+version = "1.2.1"
+description = "Official Python SDK for the Execlave AI Governance Platform — tracing, policy enforcement, and framework auto-instrumentation for LangChain, OpenAI Agents SDK, CrewAI, LlamaIndex, MCP, OpenAI Chat Completions, and AutoGen"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    { name = "Rishit Mavani", email = "support@execlave.com" }
+]
+requires-python = ">=3.11"
+keywords = [
+    "ai",
+    "governance",
+    "llm",
+    "agents",
+    "compliance",
+    "observability",
+    "tracing",
+    "policy-enforcement",
+    "ai-agents",
+    "real-time-enforcement",
+    "audit",
+    "security",
+    "monitoring",
+    "langchain",
+    "openai-agents",
+    "crewai",
+    "llamaindex",
+    "model-context-protocol",
+    "mcp",
+    "openai",
+    "autogen",
+    "agent-governance",
+    "ai-safety",
+    "guardrails",
+    "ai-compliance",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: AsyncIO",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Security",
+    "Topic :: System :: Monitoring",
+    "Topic :: Software Development :: Libraries",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "requests>=2.33.0",
+]
+
+[project.urls]
+Homepage = "https://www.execlave.com"
+Documentation = "https://www.execlave.com/docs/sdk-reference"
+Repository = "https://github.com/execlave-ai/execlave-python-sdk"
+Issues = "https://github.com/execlave-ai/execlave-python-sdk/issues"
+Changelog = "https://github.com/execlave-ai/execlave-python-sdk/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+otel = [
+    "opentelemetry-sdk>=1.20.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.20.0",
+]
+realtime = ["python-socketio>=5.0"]
+langchain = ["langchain-core>=0.3,<0.4"]
+openai-agents = ["openai-agents>=0.0.1"]
+crewai = ["crewai>=0.80,<1"]
+llamaindex = ["llama-index-core>=0.11"]
+mcp = ["mcp>=1.0"]
+openai = ["openai>=1.0"]
+autogen = ["pyautogen>=0.2"]
+test = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[tool.flit.module]
+name = "execlave"
+
+[tool.flit.sdist]
+exclude = ["tests/", "test_run.py", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+]
+addopts = "-v --tb=short"
+
+[build-system]
+requires = ["flit_core>=3.4"]
+build-backend = "flit_core.buildapi"
