@@ -1,0 +1,28 @@
+name: "Feature request"
+description: "Suggest a capability for execlave-sdk"
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: "What problem are you trying to solve?"
+      description: "Describe the use case. Avoid prescribing a specific solution here."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Proposed API or behaviour"
+      description: "Code snippets welcome. Be explicit about compatibility."
+      render: python
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Alternatives considered"
+  - type: checkboxes
+    id: willing-to-pr
+    attributes:
+      label: "Are you willing to open a PR?"
+      options:
+        - label: "Yes, I can implement this"
+        - label: "Yes, with guidance from a maintainer"

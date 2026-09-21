@@ -1,0 +1,1922 @@
+"""
+Execlave SDK — Main client.
+
+Provides the Execlave class for agent registration, tracing, and governance.
+Implements non-blocking trace ingestion with an in-memory circular buffer
+and a background flush thread.  Includes client-side PII scrubbing and
+prompt-injection pre-screening.
+"""
+
+import hashlib
+import hmac
+import json
+import os
+import re
+import time
+import uuid
+import logging
+import functools
+import threading
+from collections import deque
+from datetime import datetime, timezone
+from typing import Any, Callable, Optional, Dict, List
+from urllib.parse import urlsplit, urlunsplit
+
+import requests  # type: ignore[import-untyped]
+
+from .errors import (
+    ExeclaveError,
+    ExeclaveAuthError,
+    AgentPausedError,
+    PolicyBlockedError,
+    policy_blocked_error_from_violations,
+    PolicyDeniedError,
+    ApprovalTimeoutError,
+    CertificateMismatchError,
+    ApprovalVerificationError,
+    EnforcementUnavailableError,
+    QuotaExceededError,
+    PlanLimitExceededError,
+)
+from .agent import Agent
+from .bypass_reporter import BypassWindowReporter
+from .trace import Trace
+
+logger = logging.getLogger("Execlave")
+
+# Cadence of the background thread that closes idle bypass windows and sends
+# closed ones, and the most a shutdown() will wait for that delivery.
+_BYPASS_REPORT_INTERVAL_SECONDS = 10.0
+_BYPASS_SHUTDOWN_TIMEOUT_SECONDS = 3.0
+# Per-request timeout for the report itself; the enforcement path never waits on it.
+_BYPASS_REPORT_TIMEOUT_SECONDS = 10.0
+
+
+def _sdk_version() -> str:
+    """Installed package version, for stamping bypass reports."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version("execlave-sdk")
+        except PackageNotFoundError:
+            return "0.0.0+local"
+    except Exception:  # noqa: BLE001 - a version string must never break the client
+        return "unknown"
+
+
+def _normalize_base_url(base_url: str) -> str:
+    """Normalize API URLs while preserving explicit local/test HTTP endpoints."""
+    normalized = base_url.rstrip("/")
+    parsed = urlsplit(normalized)
+    if (
+        parsed.scheme.lower() == "http"
+        and parsed.netloc.lower() == "api.execlave.com"
+    ):
+        return urlunsplit(("https", parsed.netloc, parsed.path, parsed.query, parsed.fragment))
+    return normalized
+
+
+def _parse_iso_timestamp(value: str) -> float:
+    """Parse an ISO-8601 timestamp into epoch seconds."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
+
+# ---------------------------------------------------------------------------
+# Optional WebSocket support (python-socketio)
+# ---------------------------------------------------------------------------
+try:
+    import socketio as _socketio_mod  # type: ignore[import-not-found]
+    _HAS_SOCKETIO = True
+except ImportError:
+    _socketio_mod = None  # type: ignore[assignment]
+    _HAS_SOCKETIO = False
+
+# ---------------------------------------------------------------------------
+# SDK State enum
+# ---------------------------------------------------------------------------
+_STATE_INITIALIZING = "INITIALIZING"
+_STATE_ACTIVE = "ACTIVE"
+_STATE_PAUSED = "PAUSED"
+_STATE_SHUTDOWN = "SHUTDOWN"
+
+# ---------------------------------------------------------------------------
+# PII patterns  (same as the processing service, but usable client-side)
+# ---------------------------------------------------------------------------
+_PII_PATTERNS: Dict[str, re.Pattern] = {
+    "email": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", re.IGNORECASE),
+    "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "credit_card": re.compile(r"\b(?:\d{4}[- ]?){3}\d{4}\b"),
+    "phone_us": re.compile(r"\b(?:\+1[-.\s]?)?\(?[2-9]\d{2}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+    "ip_address": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    "api_key": re.compile(r"\b(?:sk|pk|ag)_[a-zA-Z0-9]{20,}\b"),
+}
+
+# ---------------------------------------------------------------------------
+# Injection patterns  (common prompt-injection signatures)
+# ---------------------------------------------------------------------------
+_INJECTION_PATTERNS: List[re.Pattern] = [
+    re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.IGNORECASE),
+    re.compile(r"ignore\s+(all\s+)?above\s+instructions", re.IGNORECASE),
+    re.compile(r"disregard\s+(all\s+)?previous", re.IGNORECASE),
+    re.compile(r"you\s+are\s+now\s+(?:a\s+)?(?:DAN|evil|unrestricted)", re.IGNORECASE),
+    re.compile(r"forget\s+(all\s+)?(?:previous|earlier|your)\s+(?:instructions|rules|guidelines)", re.IGNORECASE),
+    re.compile(r"system\s*:\s*you\s+are", re.IGNORECASE),
+    re.compile(r"\[SYSTEM\]|\[INST\]|\[/INST\]", re.IGNORECASE),
+    re.compile(r"<\|(?:system|im_start|im_end)\|>", re.IGNORECASE),
+    re.compile(r"(?:reveal|show|display|print|output)\s+(?:your\s+)?(?:system\s+)?(?:prompt|instructions|rules)", re.IGNORECASE),
+    re.compile(r"(?:act|behave|respond)\s+as\s+(?:if|though)\s+(?:you\s+(?:are|were|have))", re.IGNORECASE),
+    re.compile(r"do\s+anything\s+now", re.IGNORECASE),
+    re.compile(r"jailbreak", re.IGNORECASE),
+    re.compile(r"bypass\s+(?:your\s+)?(?:filters?|restrictions?|safety|guidelines?)", re.IGNORECASE),
+]
+
+
+class _HmacSigner:
+    """A ``requests`` auth callable that HMAC-signs each request body.
+
+    Set as ``session.auth`` so it runs once, after the body is prepared, for
+    every request through the session. It signs the exact serialized body bytes
+    that will be sent (``${timestamp}.${body}``) and attaches the
+    ``X-Execlave-Timestamp`` / ``X-Execlave-Signature`` headers the backend
+    verifies. Keyed by the API key.
+    """
+
+    def __init__(self, key: str):
+        self._key = key.encode("utf-8")
+
+    def __call__(self, request):  # request: requests.PreparedRequest
+        body = request.body or b""
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        timestamp = str(int(time.time()))
+        message = timestamp.encode("utf-8") + b"." + body
+        signature = "sha256=" + hmac.new(self._key, message, hashlib.sha256).hexdigest()
+        request.headers["X-Execlave-Timestamp"] = timestamp
+        request.headers["X-Execlave-Signature"] = signature
+        return request
+
+
+class Execlave:
+    """
+    Main entry point for the Execlave SDK.
+
+    Usage::
+
+        exe = Execlave(api_key="exe_prod_xxx", environment="production")
+        agent = exe.register_agent(agent_id="my-bot", name="My Bot", ...)
+
+        @exe.trace
+        def answer(question):
+            return llm.call(question)
+
+        with exe.trace(session_id="sess_1") as t:
+            result = do_work()
+            t.set_output(result)
+    """
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        base_url: str | None = None,
+        environment: str = "production",
+        async_mode: bool = True,
+        mode: str = "native",
+        otlp_endpoint: str | None = None,
+        batch_size: int = 100,
+        flush_interval_seconds: int = 10,
+        debug: bool = False,
+        privacy: dict | None = None,
+        enable_control_channel: bool = True,
+        enable_injection_scan: bool = True,
+        enforcement_on_outage: str = "fail_open",
+        on_enforcement_bypassed: "Optional[Callable[[dict], None]]" = None,
+        plan_limit_behavior: str = "fail_open",
+        heartbeat_interval_seconds: int = 600,
+        policy_cache_ttl_seconds: int = 60,
+        api_version: str | None = "v1",
+        stamp_identity: bool = False,
+        sign_requests: bool = False,
+        report_bypasses_to_platform: bool = True,
+    ):
+        self.api_key = api_key or os.environ.get("EXECLAVE_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "api_key must be provided or EXECLAVE_API_KEY env var must be set"
+            )
+
+        self.base_url = _normalize_base_url(
+            base_url or os.environ.get("EXECLAVE_BASE_URL") or "https://api.execlave.com"
+        )
+        self.api_version = api_version if api_version else None
+        self.environment = environment
+        self.async_mode = async_mode
+        self.mode = mode
+        self.batch_size = batch_size
+        self.flush_interval_seconds = flush_interval_seconds
+        self.debug = debug
+        self.privacy = privacy or {}
+        self.enable_control_channel = enable_control_channel
+        self.enable_injection_scan = enable_injection_scan
+        self.enforcement_on_outage = enforcement_on_outage  # 'fail_open' or 'fail_closed'
+        self.on_enforcement_bypassed = on_enforcement_bypassed
+        self.plan_limit_behavior = plan_limit_behavior  # 'fail_open' or 'fail_closed'
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self.policy_cache_ttl_seconds = policy_cache_ttl_seconds
+        # p3 — attach a signed agent credential (exe_agt_) to each trace on ingest.
+        self.stamp_identity = stamp_identity
+
+        if debug:
+            logging.basicConfig(level=logging.DEBUG)
+            logger.setLevel(logging.DEBUG)
+
+        # HTTP session
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "Execlave-python-sdk/1.0.0",
+        })
+        # Optional HMAC request signing (defense-in-depth + replay protection).
+        # As a session-level auth callable it signs every request's body once,
+        # after preparation, so all call sites are covered from a single point.
+        self.sign_requests = sign_requests
+        if sign_requests:
+            self._session.auth = _HmacSigner(self.api_key)
+
+        # Enforcement-bypass reporting. on_enforcement_bypassed tells only this
+        # process; the reporter puts each ungoverned window on the platform's
+        # audit trail so "no record" stops reading as "fully governed". The
+        # sender thread starts lazily on the first bypass, so a client that never
+        # bypasses costs nothing.
+        self.report_bypasses_to_platform = report_bypasses_to_platform
+        self._bypass_reporter: BypassWindowReporter | None = None
+        self._bypass_thread: threading.Thread | None = None
+        self._bypass_thread_lock = threading.Lock()
+        self._bypass_stop = threading.Event()
+        if report_bypasses_to_platform:
+            self._bypass_reporter = BypassWindowReporter(
+                self._send_bypass_report,
+                {"name": "execlave-sdk", "language": "python", "version": _sdk_version()},
+                logger=logger,
+            )
+
+        # State machine: INITIALIZING → ACTIVE → PAUSED → ACTIVE / SHUTDOWN
+        self._state = _STATE_INITIALIZING
+
+        # In-memory circular buffer (max 10,000 traces)
+        self._buffer: deque = deque(maxlen=10_000)
+        self._buffer_lock = threading.Lock()
+
+        # Background flush thread
+        self._flush_event = threading.Event()
+        self._flush_thread: threading.Thread | None = None
+        if async_mode:
+            self._flush_thread = threading.Thread(
+                target=self._flush_loop, daemon=True, name="Execlave-flush"
+            )
+            self._flush_thread.start()
+
+        # Track registered agents for status polling
+        self._agents: dict[str, Agent] = {}
+        self._agent_credential_cache: dict[str, dict[str, Any]] = {}
+
+        # Circuit breaker state
+        self._cb_failures: int = 0
+        self._cb_threshold: int = 3
+        self._cb_open: bool = False
+        self._cb_open_at: float = 0.0
+        self._cb_reset_after: float = 60.0  # seconds before retrying after circuit opens
+        self._cb_last_error: str | None = None
+        self._cb_lock = threading.Lock()
+
+        # Policy decision cache: {cache_key: {"response": dict, "expires_at": float}}
+        self._policy_cache: dict[str, dict] = {}
+        self._policy_cache_lock = threading.Lock()
+
+        # Quota-exhausted cache for trace-related operations (60s fail-fast)
+        self._quota_exceeded: QuotaExceededError | None = None
+        self._quota_expires_at: float = 0.0
+        self._quota_cache_ttl_seconds: float = 60.0
+
+        # Background status polling thread (control channel fallback)
+        self._poll_interval_seconds = 15
+        self._poll_thread: threading.Thread | None = None
+        if enable_control_channel:
+            self._poll_thread = threading.Thread(
+                target=self._status_poll_loop, daemon=True, name="Execlave-poll"
+            )
+            self._poll_thread.start()
+
+        # WebSocket control channel (real-time kill-switch, <500ms latency)
+        self._sio: Any = None
+        if enable_control_channel and _HAS_SOCKETIO:
+            self._connect_websocket()
+
+        self._state = _STATE_ACTIVE
+
+        # Heartbeat background thread
+        self._heartbeat_thread: threading.Thread | None = None
+        if enable_control_channel:
+            self._heartbeat_thread = threading.Thread(
+                target=self._heartbeat_loop, daemon=True, name="Execlave-heartbeat"
+            )
+            self._heartbeat_thread.start()
+
+        # OTel exporter (initialized only when mode is "otlp")
+        self._otel_exporter = None
+        if self.mode == "otlp":
+            if not otlp_endpoint:
+                raise ValueError("otlp_endpoint is required when mode='otlp'")
+            from .otel import OTelExporter
+            self._otel_exporter = OTelExporter(
+                endpoint=otlp_endpoint,
+                api_key=self.api_key,
+                service_name=f"Execlave-{self.environment}",
+            )
+            logger.info("OTel OTLP exporter initialized (endpoint=%s)", otlp_endpoint)
+
+        logger.debug("Execlave SDK initialized (env=%s, async=%s)", environment, async_mode)
+
+    # ------------------------------------------------------------------
+    # API path helper
+    # ------------------------------------------------------------------
+
+    def _api_path(self, path: str) -> str:
+        """Prepend the versioned API prefix to a resource path.
+
+        If ``api_version`` is set (e.g. ``'v1'``), returns ``/api/v1{path}``.
+        Otherwise falls back to the legacy ``/api{path}`` format.
+        """
+        if self.api_version:
+            return f"/api/{self.api_version}{path}"
+        return f"/api{path}"
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def ping(self) -> bool:
+        """Check if the Execlave API is reachable and the API key is valid."""
+        try:
+            # Use unversioned /health (the versioned /api/v1/health doesn't exist)
+            # Include auth headers so invalid keys are detected early
+            resp = self._session.get(
+                f"{self.base_url}/health",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                timeout=5,
+            )
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+    def _extract_agent_payload(
+        self,
+        response: Any,
+        agent_id: str,
+        environment: str | None,
+    ) -> dict[str, Any]:
+        """Normalize agent create/search responses into a single matching agent object."""
+        payload = response.get("data", response) if isinstance(response, dict) else response
+
+        if isinstance(payload, dict):
+            response_agent_id = payload.get("agentId")
+            if response_agent_id is None or response_agent_id == agent_id:
+                return payload
+            raise ExeclaveError(
+                f"Agent registration returned agentId '{response_agent_id}' instead of '{agent_id}'"
+            )
+
+        if isinstance(payload, list):
+            agents = [item for item in payload if isinstance(item, dict)]
+            matches = [item for item in agents if item.get("agentId") == agent_id]
+            if environment:
+                exact_environment_matches = [
+                    item for item in matches if item.get("environment") == environment
+                ]
+                if exact_environment_matches:
+                    return exact_environment_matches[0]
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise ExeclaveError(
+                    f"Agent registration returned multiple entries for agentId '{agent_id}'"
+                )
+            raise ExeclaveError(
+                f"Agent registration response did not include agentId '{agent_id}'"
+            )
+
+        raise ExeclaveError(
+            f"Agent registration returned unexpected response shape: {type(payload).__name__}"
+        )
+
+    def register_agent(
+        self,
+        agent_id: str,
+        name: str,
+        type: str = "chatbot",
+        platform: str = "custom",
+        environment: str | None = None,
+        description: str | None = None,
+        owner_email: str | None = None,
+        allowed_data_sources: list[str] | None = None,
+        allowed_actions: list[str] | None = None,
+        requires_human_approval_for: list[str] | None = None,
+        tags: list[str] | None = None,
+        metadata: dict | None = None,
+        autonomy_level: str | None = None,
+    ) -> Agent:
+        """
+        Register (or re-register) an AI agent. Idempotent — call on startup.
+
+        ``autonomy_level`` (optional) declares the agent's tiered-governance
+        level — one of ``"observe"``, ``"advise"``, ``"act_with_approval"`` or
+        ``"autonomous"``. When set (and the server has tiered governance
+        enabled), the platform auto-applies the recommended control bundle for
+        that level. Omit to leave governance unchanged (backward compatible).
+
+        Returns an Agent object with prompt management methods.
+        """
+        resolved_environment = environment or self.environment
+        payload: dict[str, Any] = {
+            "agentId": agent_id,
+            "name": name,
+            "type": type,
+            "platform": platform,
+            "environment": resolved_environment,
+        }
+        if description:
+            payload["description"] = description
+        if owner_email:
+            payload["ownerEmail"] = owner_email
+        if allowed_data_sources is not None:
+            payload["allowedDataSources"] = allowed_data_sources
+        if allowed_actions is not None:
+            payload["allowedActions"] = allowed_actions
+        if requires_human_approval_for is not None:
+            payload["requiresHumanApprovalFor"] = requires_human_approval_for
+        if tags is not None:
+            payload["tags"] = tags
+        if metadata is not None:
+            payload["metadata"] = metadata
+        if autonomy_level is not None:
+            payload["autonomyLevel"] = autonomy_level
+
+        try:
+            data = self._request("POST", self._api_path("/agents"), json=payload)
+        except ExeclaveError as registration_error:
+            # If agent already exists, try to fetch it by agent_id or name
+            try:
+                agents_resp = self._request("GET", self._api_path(f"/agents?search={agent_id}"))
+            except ExeclaveError:
+                raise registration_error
+
+            try:
+                agent_data = self._extract_agent_payload(
+                    agents_resp,
+                    agent_id,
+                    resolved_environment,
+                )
+                agent = Agent(self, agent_data)
+                self._agents[agent_id] = agent
+                return agent
+            except ExeclaveError:
+                pass
+
+            # Fallback: search by name if agent_id search succeeded but did not match.
+            if name:
+                try:
+                    agents_resp = self._request("GET", self._api_path(f"/agents?search={name}"))
+                except ExeclaveError:
+                    raise registration_error
+
+                try:
+                    agent_data = self._extract_agent_payload(
+                        agents_resp,
+                        agent_id,
+                        resolved_environment,
+                    )
+                    agent = Agent(self, agent_data)
+                    self._agents[agent_id] = agent
+                    return agent
+                except ExeclaveError:
+                    pass
+            raise registration_error
+
+        agent = Agent(self, self._extract_agent_payload(data, agent_id, resolved_environment))
+        self._agents[agent_id] = agent
+        return agent
+
+    def get_agent_credential(self, agent_id: str) -> dict:
+        """Get a short-lived cryptographic identity credential for an agent.
+
+        Results are cached per agent until 60 seconds before expiry.
+        """
+        cached = self._agent_credential_cache.get(agent_id)
+        if cached:
+            expires_at = cached.get("expiresAt")
+            try:
+                expires_ts = _parse_iso_timestamp(str(expires_at))
+            except ValueError:
+                expires_ts = 0.0
+            if expires_ts - time.time() > 60:
+                return cached
+
+        agent_uuid = self._resolve_agent_id(agent_id)
+        body = self._request("POST", self._api_path(f"/agents/{agent_uuid}/credential"))
+        credential = body.get("data", body)
+        self._agent_credential_cache[agent_id] = credential
+        return credential
+
+    def report_agent_metadata(
+        self,
+        agent_id: str,
+        version_label: str | None = None,
+        git_commit: str | None = None,
+        deployed_at: Any | None = None,
+        notes: str | None = None,
+        activate: bool = False,
+    ) -> dict:
+        """
+        Report deployment metadata for an agent, creating a new version snapshot
+        in the agent registry (Phase 2.1). Optional and additive — call from your
+        deploy pipeline on each release to build a version history.
+
+        ``version_label`` (e.g. ``"v2.1.0"``), ``git_commit`` and ``deployed_at``
+        are recorded as version metadata. Set ``activate=True`` to mark this the
+        active version. Requires the server to have the agent registry enabled;
+        otherwise the call is rejected with a not-enabled error.
+
+        Returns the created version record. Raises ExeclaveError if the agent is
+        not known to this client (call ``register_agent`` first).
+        """
+        cached = self._agents.get(agent_id)
+        agent_uuid = cached.id if cached else None
+        if not agent_uuid:
+            # Resolve UUID by external id via the registry-independent agents API.
+            resp = self._request("GET", self._api_path(f"/agents?search={agent_id}"))
+            agent_data = self._extract_agent_payload(resp, agent_id, self.environment)
+            agent_uuid = agent_data.get("id")
+        if not agent_uuid:
+            raise ExeclaveError(f"Unknown agent '{agent_id}'; call register_agent() first")
+
+        metadata: dict[str, Any] = {}
+        if git_commit is not None:
+            metadata["gitCommit"] = git_commit
+        if deployed_at is not None:
+            metadata["deployedAt"] = (
+                deployed_at.isoformat() if hasattr(deployed_at, "isoformat") else str(deployed_at)
+            )
+
+        payload: dict[str, Any] = {"activate": activate}
+        if version_label is not None:
+            payload["versionLabel"] = version_label
+        if notes is not None:
+            payload["notes"] = notes
+        if metadata:
+            payload["metadata"] = metadata
+
+        return self._request("POST", self._api_path(f"/agents/{agent_uuid}/versions"), json=payload)
+
+    @staticmethod
+    def tool_descriptor(
+        server: str,
+        tool: str,
+        descriptor: Any,
+        description: str | None = None,
+    ) -> dict:
+        """
+        Compute the SHA-256 descriptor hash for an MCP tool definition.
+
+        Pass the raw tool object (name + description + input schema, etc.); the
+        hash is stable across key order. Use the result in the
+        ``tool_descriptors`` argument of :meth:`enforce_policy` and in
+        :meth:`report_tool_baseline`.
+        """
+        canonical = json.dumps(descriptor, sort_keys=True, separators=(",", ":"))
+        descriptor_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        out: dict[str, Any] = {
+            "server": server,
+            "tool": tool,
+            "descriptorHash": descriptor_hash,
+        }
+        if description is not None:
+            out["description"] = description
+        return out
+
+    def report_tool_baseline(
+        self,
+        agent_id: str,
+        descriptors: list[dict],
+        reason: str = "manual",
+    ) -> dict:
+        """
+        Pin the approved set of MCP tool descriptors for an agent (the
+        ``tool_integrity`` baseline future :meth:`enforce_policy` calls are
+        diffed against). Call after a reviewed deploy; re-pin with
+        ``reason="baseline_update"`` after a legitimate tool update. Requires the
+        server to have tool integrity governance enabled.
+
+        Each descriptor is a dict with ``server``, ``tool``, ``descriptorHash``
+        and optional ``descriptionHash`` — build them with :meth:`tool_descriptor`.
+        """
+        agent_uuid = self._resolve_agent_id(agent_id)
+        return self._request(
+            "POST",
+            self._api_path(f"/tool-integrity/agents/{agent_uuid}/baseline"),
+            json={"descriptors": descriptors, "reason": reason},
+        )
+
+    def verify_approval(self, approval_id: str, action_context: dict) -> dict:
+        """Verify an approval certificate against the action context to execute."""
+        body = self._request(
+            "POST",
+            self._api_path(f"/approvals/{approval_id}/verify"),
+            json={"actionContext": action_context},
+        )
+        return body.get("data", body)
+
+    # ------------------------------------------------------------------
+    # Tracing — can be used as decorator or context manager
+    # ------------------------------------------------------------------
+
+    def trace(
+        self,
+        func: Callable | None = None,
+        *,
+        session_id: str | None = None,
+        user_id: str | None = None,
+        metadata: dict | None = None,
+        agent_id: str | None = None,
+        tags: list[str] | None = None,
+        environment: str | None = None,
+        parent_trace_id: str | None = None,
+        span_type: str | None = None,
+    ):
+        """
+        Trace an execution. Can be used three ways:
+
+        1. **Decorator** (no args):  ``@exe.trace``
+        2. **Decorator** (with args):  ``@exe.trace(session_id="s1")``
+        3. **Context manager**:   ``with exe.trace(session_id="s1") as t: ...``
+        """
+        if self._state == _STATE_PAUSED:
+            # If used as decorator call, we need to figure out which agent
+            raise AgentPausedError(agent_id or "unknown")
+
+        if self._state == _STATE_SHUTDOWN:
+            raise ExeclaveError("SDK has been shut down. Call not allowed.")
+
+        # Resolve the agent_id from the first registered agent if not provided
+        resolved_agent_id = agent_id
+        if not resolved_agent_id and self._agents:
+            first_agent = next(iter(self._agents.values()))
+            resolved_agent_id = first_agent.agent_id
+
+        resolved_environment = environment or self.environment
+
+        # Case 1: @exe.trace  (func is the decorated function)
+        if func is not None and callable(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                if self._state == _STATE_PAUSED:
+                    raise AgentPausedError(resolved_agent_id or "unknown")
+                t = Trace(
+                    self,
+                    agent_id=resolved_agent_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    metadata=metadata,
+                    tags=tags,
+                    environment=resolved_environment,
+                    parent_trace_id=parent_trace_id,
+                    span_type=span_type,
+                )
+                try:
+                    result = func(*args, **kwargs)
+                    t.set_output(result)
+                    t.finish(status="success")
+                    return result
+                except Exception as e:
+                    t.finish(status="error", error_message=str(e), error_type=type(e).__name__)
+                    raise
+            return wrapper
+
+        # Case 2/3: exe.trace(session_id=...) — returns decorator or context manager
+        # If called with no func arg, we return a Trace (context manager) or a decorator
+        trace_obj = Trace(
+            self,
+            agent_id=resolved_agent_id,
+            session_id=session_id,
+            user_id=user_id,
+            metadata=metadata,
+            tags=tags,
+            environment=resolved_environment,
+            parent_trace_id=parent_trace_id,
+            span_type=span_type,
+        )
+        return trace_obj
+
+    # Cross-language parity: ``wrap`` is the JS SDK's name for the same role.
+    def wrap(
+        self,
+        func: Callable | None = None,
+        *,
+        session_id: str | None = None,
+        user_id: str | None = None,
+        metadata: dict | None = None,
+        agent_id: str | None = None,
+    ):
+        """Alias for :meth:`trace`. Provided for parity with the JS SDK ``wrap()``."""
+        return self.trace(
+            func,
+            session_id=session_id,
+            user_id=user_id,
+            metadata=metadata,
+            agent_id=agent_id,
+        )
+
+    def start_trace(
+        self,
+        trace_id: str | None = None,
+        session_id: str | None = None,
+        user_id: str | None = None,
+        agent_id: str | None = None,
+        metadata: dict | None = None,
+        tags: list[str] | None = None,
+        environment: str | None = None,
+        parent_trace_id: str | None = None,
+        span_type: str | None = None,
+    ) -> Trace:
+        """
+        Start a manual trace. You must call ``trace.finish()`` when done.
+        """
+        if self._state == _STATE_PAUSED:
+            raise AgentPausedError(agent_id or "unknown")
+
+        resolved_agent_id = agent_id
+        if not resolved_agent_id and self._agents:
+            first_agent = next(iter(self._agents.values()))
+            resolved_agent_id = first_agent.agent_id
+
+        return Trace(
+            self,
+            agent_id=resolved_agent_id,
+            trace_id=trace_id,
+            session_id=session_id,
+            user_id=user_id,
+            metadata=metadata,
+            tags=tags,
+            environment=environment or self.environment,
+            parent_trace_id=parent_trace_id,
+            span_type=span_type,
+        )
+
+    # ------------------------------------------------------------------
+    # Flush / Shutdown
+    # ------------------------------------------------------------------
+    # Enforcement & Authorization
+    # ------------------------------------------------------------------
+
+    # -----------------------------------------------------------------------
+    # Circuit breaker helpers
+    # -----------------------------------------------------------------------
+
+    def _cb_record_success(self) -> None:
+        with self._cb_lock:
+            self._cb_failures = 0
+            self._cb_open = False
+            self._cb_last_error = None
+
+    def _cb_record_failure(self, error_msg: str) -> None:
+        with self._cb_lock:
+            self._cb_failures += 1
+            self._cb_last_error = error_msg
+            if self._cb_failures >= self._cb_threshold:
+                self._cb_open = True
+                self._cb_open_at = time.time()
+                logger.warning(
+                    "Circuit breaker OPEN after %d consecutive failures (mode=%s)",
+                    self._cb_failures,
+                    self.enforcement_on_outage,
+                )
+
+    def _cb_is_open(self) -> bool:
+        with self._cb_lock:
+            if not self._cb_open:
+                return False
+            # Half-open: allow one retry after reset period
+            if time.time() - self._cb_open_at > self._cb_reset_after:
+                logger.info("Circuit breaker half-open — retrying enforcement")
+                return False
+            return True
+
+    # -----------------------------------------------------------------------
+    # Policy cache helpers
+    # -----------------------------------------------------------------------
+
+    def _cache_key(
+        self,
+        agent_id: str,
+        input_text: str,
+        environment: str,
+        metadata: dict | None = None,
+        estimated_cost: float | None = None,
+        tools: list[str] | None = None,
+        conversation_history: list[dict] | None = None,
+        tool_outputs: list[dict] | None = None,
+    ) -> str:
+        # Every field the server treats as governance-relevant action context
+        # must be part of the cache key. Keying on input/environment/agent_id
+        # alone let two calls with different metadata (e.g. different full
+        # tool arguments behind a colliding/truncated input string) share a
+        # cached decision -- the second call never even reached the server,
+        # metadata included or not. conversation_history is included because it
+        # changes the injection-scan verdict (a crescendo). default=str
+        # guarantees this never raises for an exotic value; it only needs to
+        # differentiate, not exactly match the server's canonical hash.
+        try:
+            extra = json.dumps(
+                [metadata, estimated_cost, tools, conversation_history, tool_outputs],
+                sort_keys=True,
+                default=str,
+            )
+        except (TypeError, ValueError):
+            extra = "__unserializable__"
+        h = hashlib.sha256(
+            f"{environment}:{agent_id}:{input_text}:{extra}".encode()
+        ).hexdigest()[:16]
+        return f"policy:{h}"
+
+    def _cache_get(self, key: str) -> dict | None:
+        with self._policy_cache_lock:
+            entry = self._policy_cache.get(key)
+            if entry and entry["expires_at"] > time.time():
+                return entry["response"]
+            if entry:
+                del self._policy_cache[key]  # expired
+            return None
+
+    def _cache_set(self, key: str, response: dict) -> None:
+        with self._policy_cache_lock:
+            self._policy_cache[key] = {
+                "response": response,
+                "expires_at": time.time() + self.policy_cache_ttl_seconds,
+            }
+            # Evict old entries (keep max 500)
+            if len(self._policy_cache) > 500:
+                oldest = sorted(self._policy_cache, key=lambda k: self._policy_cache[k]["expires_at"])
+                for old_key in oldest[:100]:
+                    del self._policy_cache[old_key]
+
+    def _flush_policy_cache(self) -> None:
+        """Drop all cached policy decisions. Called on a kill-switch pause so a
+        paused agent cannot keep executing on stale cached ALLOW entries for the
+        remainder of the cache TTL."""
+        with self._policy_cache_lock:
+            self._policy_cache.clear()
+
+    def _set_quota_exceeded(self, error: QuotaExceededError) -> None:
+        # Cache only trace quota, since we use this as fail-fast for enforce/trace paths.
+        if error.resource != "maxTracesPerMonth":
+            return
+        self._quota_exceeded = error
+        self._quota_expires_at = time.time() + self._quota_cache_ttl_seconds
+
+    def _get_cached_quota_error(self) -> QuotaExceededError | None:
+        if not self._quota_exceeded:
+            return None
+        if time.time() >= self._quota_expires_at:
+            self._quota_exceeded = None
+            self._quota_expires_at = 0.0
+            return None
+        return self._quota_exceeded
+
+    def _emit_bypass(
+        self,
+        *,
+        reason: str,
+        source: str,
+        agent_id: str,
+        message: "Optional[str]" = None,
+        status: "Optional[int]" = None,
+        consecutive_failures: "Optional[int]" = None,
+    ) -> None:
+        """Report that enforcement was bypassed and the action proceeded anyway.
+
+        Under ``fail_open`` (the default) an outage is otherwise invisible: the
+        call returns ``allowed: True`` and the only trace is a log line. That
+        window — the agent running ungoverned — is exactly what an auditor needs,
+        so it is surfaced as a structured event for alerting or SIEM.
+
+        Timestamped here so the ungoverned window is recorded at the moment it
+        happened. A listener exception is swallowed: a faulty observer must never
+        break the enforcement path it is only watching.
+
+        The bypass is also recorded for the platform (see ``BypassWindowReporter``)
+        BEFORE the listener check: reporting must not depend on the caller having
+        wired a callback. Recording is in-memory and cheap; the network send
+        happens on a background thread.
+        """
+        if self._bypass_reporter is not None:
+            self._bypass_reporter.record(
+                reason=reason,
+                source=source,
+                agent_id=agent_id,
+                message=message,
+                status=status,
+                consecutive_failures=consecutive_failures,
+            )
+            self._ensure_bypass_thread()
+        if not self.on_enforcement_bypassed:
+            return
+        event = {
+            "reason": reason,
+            "source": source,
+            "agentId": agent_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        if message is not None:
+            event["message"] = message
+        if status is not None:
+            event["status"] = status
+        if consecutive_failures is not None:
+            event["consecutiveFailures"] = consecutive_failures
+        try:
+            self.on_enforcement_bypassed(event)
+        except Exception:  # noqa: BLE001 - observer must not break enforcement
+            logger.exception("on_enforcement_bypassed listener raised")
+
+    def _ensure_bypass_thread(self) -> None:
+        """Start the bypass sender on first use. Never raises."""
+        if self._bypass_thread is not None or self._state == _STATE_SHUTDOWN:
+            return
+        try:
+            with self._bypass_thread_lock:
+                if self._bypass_thread is not None:
+                    return
+                thread = threading.Thread(
+                    target=self._bypass_loop, daemon=True, name="Execlave-bypass-report"
+                )
+                self._bypass_thread = thread
+                thread.start()
+        except Exception:  # noqa: BLE001 - reporting must never break enforcement
+            logger.debug("Could not start bypass report thread", exc_info=True)
+
+    def _bypass_loop(self) -> None:
+        """Background thread: close idle windows, deliver closed ones."""
+        reporter = self._bypass_reporter
+        while reporter is not None and not self._bypass_stop.wait(
+            _BYPASS_REPORT_INTERVAL_SECONDS
+        ):
+            reporter.tick()
+            reporter.flush()
+
+    def _send_bypass_report(self, body: dict) -> int:
+        """POST one bypass report and return the HTTP status; raises on a network
+        failure.
+
+        Goes straight through the session rather than ``_request``: that helper
+        turns a 402 into quota state and raises, and this must never touch the
+        circuit breaker or the quota cache -- it is not an enforcement decision.
+        """
+        url = f"{self.base_url}{self._api_path('/sdk/bypass-windows')}"
+        resp = self._session.request(
+            "POST", url, json=body, timeout=_BYPASS_REPORT_TIMEOUT_SECONDS
+        )
+        return resp.status_code
+
+    def _raise_if_quota_exceeded(self) -> None:
+        cached = self._get_cached_quota_error()
+        if not cached:
+            return
+        if self.plan_limit_behavior == "fail_open":
+            return
+        raise PlanLimitExceededError(
+            resource=cached.resource,
+            current=cached.current,
+            max=cached.max,
+            message=str(cached),
+        )
+
+    @staticmethod
+    def _to_int(value: Any, default: int = 0) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    def _quota_error_from_response(self, resp: requests.Response) -> QuotaExceededError:
+        resource = "unknown"
+        current = 0
+        max_value = 0
+        message = ""
+
+        try:
+            body = resp.json()
+            err = body.get("error", {}) if isinstance(body, dict) else {}
+            resource = str(err.get("resource", "unknown"))
+            current = self._to_int(err.get("current", 0), 0)
+            max_value = self._to_int(err.get("max", 0), 0)
+            message = str(err.get("message", ""))
+        except ValueError:
+            message = ""
+
+        return QuotaExceededError(
+            resource=resource,
+            current=current,
+            max=max_value,
+            message=message,
+        )
+
+    # -----------------------------------------------------------------------
+    # Heartbeat loop
+    # -----------------------------------------------------------------------
+
+    def _heartbeat_loop(self) -> None:
+        """Background thread: pings backend heartbeat every 10 minutes."""
+        while self._state not in (_STATE_SHUTDOWN,):
+            time.sleep(self.heartbeat_interval_seconds)
+            if self._state == _STATE_SHUTDOWN:
+                break
+            for agent_id in list(self._agents.keys()):
+                try:
+                    agent = self._agents.get(agent_id)
+                    if not agent:
+                        continue
+                    self._session.post(
+                        f"{self.base_url}{self._api_path(f'/agents/{agent.id}/heartbeat')}",
+                        json={"lastPolicyCheckAt": None},
+                        timeout=10,
+                    )
+                    logger.debug("Heartbeat sent for agent %s", agent_id)
+                except Exception as e:
+                    logger.debug("Heartbeat failed for agent %s: %s", agent_id, e)
+
+    # -----------------------------------------------------------------------
+    # Agent ID Resolution
+    # -----------------------------------------------------------------------
+
+    def _resolve_agent_id(self, agent_id: str) -> str:
+        """Resolve an external agentId string to the internal UUID.
+
+        The API endpoints like /policies/enforce expect the internal UUID,
+        but users naturally pass the external agentId (e.g. "my-bot").
+        This looks up the cached Agent and returns its UUID (.id).
+        If no match is found, returns the original value unchanged.
+        """
+        agent = self._agents.get(agent_id)
+        if agent:
+            return agent.id  # internal UUID
+        # Maybe the caller already passed a UUID — return as-is
+        return agent_id
+
+    # -----------------------------------------------------------------------
+    # enforce_policy — with circuit breaker + cache
+    # -----------------------------------------------------------------------
+
+    def enforce_policy(
+        self,
+        agent_id: str,
+        input: str,
+        *,
+        environment: str | None = None,
+        metadata: dict | None = None,
+        estimated_cost: float | None = None,
+        tools: list[str] | None = None,
+        tool_descriptors: list[dict] | None = None,
+        conversation_history: list[dict] | None = None,
+        tool_outputs: list[dict] | None = None,
+    ) -> dict:
+        """
+        Pre-execution policy enforcement. Call BEFORE sending a prompt to the LLM.
+
+        Raises ``PolicyBlockedError`` if any policy in ``block`` mode fires.
+        Raises ``EnforcementUnavailableError`` if circuit breaker trips in fail_closed.
+        Returns a dict with ``allowed`` (bool) and optional ``warnings`` list.
+
+        Features:
+        - **Circuit breaker**: After 3 consecutive network failures, the circuit opens.
+          In ``fail_open`` mode, execution is allowed. In ``fail_closed``, an error is raised.
+        - **Cache**: Successful responses are cached for 60s (configurable).
+          ``require_approval`` (202) responses are never cached.
+
+        Example::
+
+            try:
+                result = guard.enforce_policy("my-agent", user_input)
+                # result["allowed"] is True; check result.get("warnings")
+            except PolicyBlockedError as e:
+                print("Blocked:", e.violations)
+        """
+        self._raise_if_quota_exceeded()
+
+        effective_environment = environment or self.environment
+
+        # 1. Check cache first
+        cache_key = self._cache_key(
+            agent_id,
+            input,
+            effective_environment,
+            metadata,
+            estimated_cost,
+            tools,
+            conversation_history,
+            tool_outputs,
+        )
+        # A cached ALLOW must not survive a kill switch. When the control
+        # channel has observed a pause we skip the cache so the request reaches
+        # the server and receives the kill-switch 403. The cache is also cleared
+        # on the pause transition itself (status-poll / WebSocket handlers), so
+        # this covers the window before that fires.
+        if self._state != _STATE_PAUSED:
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                logger.debug("Policy cache hit for %s", agent_id)
+                return cached
+
+        # 2. Check circuit breaker
+        if self._cb_is_open():
+            if self.enforcement_on_outage == "fail_closed":
+                raise EnforcementUnavailableError(
+                    self._cb_failures, self._cb_last_error
+                )
+            # fail_open: allow execution
+            logger.warning(
+                "Circuit breaker open — fail_open mode, allowing execution for %s",
+                agent_id,
+            )
+            self._emit_bypass(
+                reason="circuit_breaker_open",
+                source="fail_open_circuit_breaker",
+                agent_id=agent_id,
+                message=self._cb_last_error,
+                consecutive_failures=self._cb_failures,
+            )
+            return {"allowed": True, "source": "fail_open_circuit_breaker"}
+
+        # 3. Build payload and make HTTP call
+        # Resolve external agentId to internal UUID if we have a cached agent
+        resolved_agent_id = self._resolve_agent_id(agent_id)
+
+        # The action context is the exact object the server seals into an
+        # approval certificate (see PolicyService.createApprovalIfNeeded) —
+        # built once here and reused verbatim at verify time so a require-
+        # approval round trip reconstructs an identical canonical hash.
+        # Optional fields are OMITTED when unset (None) rather than sent as
+        # JSON null: `requests` serializes None to `null`, but an absent key
+        # is what the server's canonical hash treats an unset field as —
+        # sending an explicit null for a field that was never provided would
+        # change the digest and produce a false action_context_mismatch.
+        # `is not None` (not truthiness) so an explicitly-passed empty dict/
+        # list is preserved rather than silently dropped.
+        action_context = self._build_action_context(
+            input, effective_environment, metadata, estimated_cost, tools
+        )
+
+        payload: dict[str, Any] = {"agentId": resolved_agent_id, **action_context}
+        if tool_descriptors:
+            payload["toolDescriptors"] = tool_descriptors
+        # Not part of the sealed action context (a detection input, like
+        # tool_descriptors). Sent only when non-empty — the server schema is
+        # strict about unknown/extra fields.
+        if conversation_history:
+            payload["conversationHistory"] = conversation_history
+        if tool_outputs:
+            payload["toolOutputs"] = tool_outputs
+
+        url = f"{self.base_url}{self._api_path('/policies/enforce')}"
+        try:
+            resp = self._session.request("POST", url, json=payload, timeout=30)
+        except requests.RequestException as e:
+            # Network failure — circuit breaker. fail_closed must block on the
+            # FIRST failure, not only once the breaker has tripped: gating on
+            # the breaker threshold silently allows the first N calls through,
+            # which defeats the entire point of choosing fail_closed.
+            self._cb_record_failure(str(e))
+            if self.enforcement_on_outage == "fail_closed":
+                raise EnforcementUnavailableError(self._cb_failures, str(e)) from e
+            logger.warning("Network error in enforce_policy (fail_open): %s", e)
+            self._emit_bypass(
+                reason="network_error",
+                source="fail_open_network_error",
+                agent_id=agent_id,
+                message=str(e),
+                consecutive_failures=self._cb_failures,
+            )
+            return {"allowed": True, "source": "fail_open_network_error"}
+
+        # 4. Record success in circuit breaker — but a 5xx is NOT a successful
+        # enforcement decision. Recording it as success would keep the breaker
+        # closed through a sustained server outage and mask the fail_closed guard.
+        if resp.status_code < 500:
+            self._cb_record_success()
+            # A real server response other than a plan-limit 402 means the agent
+            # got a governed decision: its bypass windows are over. A fail-open
+            # 402 is itself a bypass, so it must keep its window open.
+            if resp.status_code != 402 and self._bypass_reporter is not None:
+                self._bypass_reporter.recover(agent_id)
+
+        # 5. Handle response codes
+        if resp.status_code == 403:
+            try:
+                body = resp.json()
+            except ValueError:
+                raise ExeclaveAuthError("Policy enforcement denied (unable to parse response)")
+            if not body.get("allowed", True):
+                raise policy_blocked_error_from_violations(body.get("violations", []))
+            raise ExeclaveAuthError("Insufficient permissions")
+
+        if resp.status_code == 202:
+            # Never cache require_approval
+            body = resp.json()
+            approval_request_id = body.get("approvalRequestId")
+            if approval_request_id:
+                return self._poll_approval_decision(approval_request_id, action_context)
+
+        if resp.status_code == 401:
+            raise ExeclaveAuthError("Invalid API key or insufficient permissions")
+
+        if resp.status_code == 402:
+            quota_error = self._quota_error_from_response(resp)
+            self._set_quota_exceeded(quota_error)
+            if self.plan_limit_behavior == "fail_open":
+                logger.warning(
+                    "Plan limit exceeded for %s (%d/%d) — continuing unmonitored",
+                    quota_error.resource, quota_error.current, quota_error.max,
+                )
+                # "Continuing unmonitored" is a governance gap even though the
+                # cause is commercial rather than an outage, so it is reported
+                # the same way — and this is the bypass most likely to fire in
+                # normal operation, so silence here is the worst place to have it.
+                self._emit_bypass(
+                    reason="plan_limit_exceeded",
+                    source="fail_open_plan_limit",
+                    agent_id=agent_id,
+                    message=str(quota_error),
+                    status=402,
+                )
+                return {
+                    "allowed": True,
+                    "source": "fail_open_plan_limit",
+                    "warnings": [{
+                        "policyId": "plan_limit",
+                        "policyName": "Plan Limit",
+                        "policyType": "plan_limit",
+                        "message": str(quota_error),
+                        "enforcementMode": "warn",
+                    }],
+                }
+            raise PlanLimitExceededError(
+                resource=quota_error.resource,
+                current=quota_error.current,
+                max=quota_error.max,
+                message=str(quota_error),
+            )
+
+        # 5xx → the enforcement decision is unavailable, exactly like a network
+        # failure (a load balancer returning 502/503 is the common outage
+        # shape). Route it through the SAME outage policy rather than a generic
+        # raise, so enforcement_on_outage is honored for server errors too.
+        if resp.status_code >= 500:
+            self._cb_record_failure(f"server {resp.status_code}")
+            if self.enforcement_on_outage == "fail_closed":
+                raise EnforcementUnavailableError(
+                    self._cb_failures, f"server error {resp.status_code}"
+                )
+            logger.warning(
+                "Server error %d in enforce_policy (fail_open): allowing",
+                resp.status_code,
+            )
+            self._emit_bypass(
+                reason="server_error",
+                source="fail_open_server_error",
+                agent_id=agent_id,
+                message=f"server error {resp.status_code}",
+                status=resp.status_code,
+                consecutive_failures=self._cb_failures,
+            )
+            return {"allowed": True, "source": "fail_open_server_error"}
+
+        if not resp.ok:
+            msg = f"API request failed ({resp.status_code})"
+            try:
+                err = resp.json()
+                if "error" in err:
+                    msg += f": {err['error'].get('message', '')}"
+            except ValueError:
+                msg += f": {resp.text[:200]}"
+            raise ExeclaveError(msg)
+
+        # 6. Cache the successful result
+        result = resp.json()
+        self._cache_set(cache_key, result)
+        return result
+
+    def enforce_tool_output(
+        self,
+        agent_id: str,
+        tool_name: str,
+        output: Any,
+        *,
+        input: Any = None,
+        environment: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        """Synchronously scan a tool's output BEFORE feeding it back to the model
+        -- the preventive side of ``tool_output_scan``. Call after a tool returns
+        and before the agent consumes the result: a block-mode policy raises
+        ``PolicyBlockedError``, letting you stop a poisoned or PII-laden tool
+        result (indirect prompt injection) from reaching the model.
+
+        Example::
+
+            raw = tool.run(args)
+            guard.enforce_tool_output("bot", "web_search", raw)  # raises if blocked
+            answer = llm(raw)
+        """
+        return self.enforce_policy(
+            agent_id,
+            # enforce requires a non-empty input; the actual scan subject is the
+            # tool output supplied below.
+            f"tool_output:{tool_name}",
+            environment=environment,
+            metadata=metadata,
+            tool_outputs=[{"name": tool_name, "input": input, "output": output}],
+        )
+
+    @staticmethod
+    def _build_action_context(
+        input: str,
+        environment: str,
+        metadata: dict | None,
+        estimated_cost: float | None,
+        tools: list[str] | None,
+    ) -> dict[str, Any]:
+        """Build the action-context object the server seals into an approval
+        certificate. Single definition shared by enforce_policy (build) and
+        _verify_approved_decision (reconstruct), so the two cannot drift."""
+        ctx: dict[str, Any] = {"input": input, "environment": environment}
+        if metadata is not None:
+            ctx["metadata"] = metadata
+        if estimated_cost is not None:
+            ctx["estimatedCost"] = estimated_cost
+        if tools is not None:
+            ctx["tools"] = tools
+        return ctx
+
+    def _poll_approval_decision(
+        self, approval_request_id: str, approved_action_context: dict[str, Any]
+    ) -> dict:
+        timeout_seconds = 30 * 60
+        poll_interval_seconds = 5
+        started_at = time.time()
+
+        while time.time() - started_at < timeout_seconds:
+            try:
+                resp = self._session.request(
+                    "GET",
+                    f"{self.base_url}{self._api_path(f'/approvals/{approval_request_id}')}",
+                    timeout=30,
+                )
+            except requests.RequestException as e:
+                raise ExeclaveError(f"Network error: {e}") from e
+
+            if not resp.ok:
+                raise ExeclaveError(f"Approval polling failed ({resp.status_code})")
+
+            body = resp.json()
+            approval = body.get("data", {})
+            status = approval.get("status")
+
+            if status == "approved":
+                # Closed loop: never trust status == "approved" alone. Confirm
+                # the authorization certificate binds to THIS action before
+                # allowing it.
+                return self._verify_approved_decision(
+                    approval_request_id, approved_action_context
+                )
+            if status == "denied":
+                raise PolicyDeniedError(approval_request_id, approval.get("decisionReason"))
+            if status == "expired":
+                raise ApprovalTimeoutError(approval_request_id)
+
+            time.sleep(poll_interval_seconds)
+
+        raise ApprovalTimeoutError(approval_request_id)
+
+    def _verify_approved_decision(
+        self, approval_request_id: str, approved_action_context: dict[str, Any]
+    ) -> dict:
+        """Mandatory certificate verification for an approved request.
+        Fail-closed on every axis:
+          - the verify call itself failing (network/5xx/malformed) ->
+            ApprovalVerificationError (no confirmation, no execution);
+          - a definitive valid=False from the server -> CertificateMismatchError
+            (the action does not match what a human approved).
+        Only valid=True returns an allowed result.
+        """
+        try:
+            verification = self.verify_approval(approval_request_id, approved_action_context)
+        except Exception as e:
+            # Distinct from a definitive valid=False — the SDK could not
+            # obtain a verdict at all. Fail closed.
+            raise ApprovalVerificationError(approval_request_id, str(e)) from e
+
+        if not isinstance(verification, dict) or not isinstance(verification.get("valid"), bool):
+            raise ApprovalVerificationError(
+                approval_request_id, "malformed verification response"
+            )
+
+        if not verification["valid"]:
+            raise CertificateMismatchError(approval_request_id, verification.get("reason"))
+
+        result: dict[str, Any] = {"allowed": True, "approvalRequestId": approval_request_id}
+        if "certificate" in verification:
+            result["certificate"] = verification["certificate"]
+        return result
+
+    def authorize_agent_call(
+        self,
+        caller_agent_id: str,
+        callee_agent_id: str,
+        action: str,
+    ) -> dict:
+        """
+        Check whether *caller* is authorized to invoke *callee* for *action*.
+
+        Raises ``ExeclaveAuthError`` (403) when the grant does not exist.
+        Returns the grant record on success.
+        """
+        return self._request(
+            "POST",
+            self._api_path("/agents/authorize"),
+            json={
+                "callerAgentId": caller_agent_id,
+                "calleeAgentId": callee_agent_id,
+                "action": action,
+            },
+        )
+
+    def discover_agents(self, capability: str | None = None) -> list[dict]:
+        """
+        Discover agents available to the organization, optionally filtered by
+        *capability*.
+
+        Returns a list of agent dicts with ``id``, ``agentId``, ``name``,
+        and ``capabilities``.
+        """
+        path = self._api_path("/agents/discover")
+        if capability:
+            path += f"?capability={capability}"
+        result = self._request("GET", path)
+        return result.get("data", result) if isinstance(result, dict) else result
+
+    def check_usage(self) -> dict:
+        """Return current plan usage and limits from the billing usage endpoint."""
+        result = self._request("GET", self._api_path("/billing/usage"))
+        data = result.get("data", result) if isinstance(result, dict) else {}
+
+        usage_block = data.get("usage") if isinstance(data, dict) else None
+
+        def pick_usage(resource: str) -> dict:
+            if isinstance(usage_block, dict) and isinstance(usage_block.get(resource), dict):
+                bucket = usage_block.get(resource, {})
+                return {
+                    "current": self._to_int(bucket.get("current", 0), 0),
+                    "max": self._to_int(bucket.get("max", 0), 0),
+                }
+
+            fallback = data.get(resource, {}) if isinstance(data, dict) else {}
+            return {
+                "current": self._to_int(fallback.get("current", 0), 0),
+                "max": self._to_int(fallback.get("max", 0), 0),
+            }
+
+        return {
+            "plan": data.get("plan", "unknown") if isinstance(data, dict) else "unknown",
+            "agents": pick_usage("agents"),
+            "traces": pick_usage("traces"),
+            "users": pick_usage("users"),
+            "policies": pick_usage("policies"),
+            "upgradeUrl": (
+                data.get("upgradeUrl")
+                if isinstance(data, dict)
+                else None
+            )
+            or "https://www.execlave.com/dashboard/billing",
+        }
+
+    # ------------------------------------------------------------------
+
+    def flush(self) -> None:
+        """
+        Flush all buffered traces to the Execlave API.
+        Call this before shutdown (or register with ``atexit``).
+        """
+        self._do_flush(raise_quota_error=False)
+
+    def shutdown(self) -> None:
+        """Flush and shut down the SDK."""
+        self._state = _STATE_SHUTDOWN
+        # Close open bypass windows and make one bounded attempt to deliver
+        # them: a shutdown during an outage is when there is most to report, and
+        # it must not hang on the same dead endpoint.
+        self._bypass_stop.set()
+        if self._bypass_reporter is not None:
+            self._bypass_reporter.drain(_BYPASS_SHUTDOWN_TIMEOUT_SECONDS)
+        self.flush()
+        if self._flush_thread and self._flush_thread.is_alive():
+            self._flush_event.set()
+            self._flush_thread.join(timeout=5)
+        if self._poll_thread and self._poll_thread.is_alive():
+            self._poll_thread.join(timeout=3)
+        # Disconnect WebSocket
+        if self._sio:
+            try:
+                self._sio.disconnect()
+            except Exception:
+                pass
+            self._sio = None
+        if self._otel_exporter:
+            self._otel_exporter.shutdown()
+        logger.debug("Execlave SDK shut down")
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _request(self, method: str, path: str, **kwargs) -> dict:
+        """Make an authenticated HTTP request to the Execlave API."""
+        url = f"{self.base_url}{path}"
+        try:
+            resp = self._session.request(method, url, timeout=30, **kwargs)
+        except requests.RequestException as e:
+            raise ExeclaveError(f"Network error: {e}") from e
+
+        if resp.status_code == 402:
+            quota_error = self._quota_error_from_response(resp)
+            self._set_quota_exceeded(quota_error)
+            raise quota_error
+
+        if resp.status_code in (401, 403):
+            raise ExeclaveAuthError("Invalid API key or insufficient permissions")
+
+        if not resp.ok:
+            msg = f"API request failed ({resp.status_code})"
+            try:
+                err = resp.json()
+                if "error" in err:
+                    msg += f": {err['error'].get('message', '')}"
+            except ValueError:
+                msg += f": {resp.text[:200]}"
+            raise ExeclaveError(msg)
+
+        return resp.json()
+
+    def _buffer_trace(self, payload: dict) -> None:
+        """Add a trace payload to the in-memory buffer, applying privacy/injection pre-processing."""
+        self._raise_if_quota_exceeded()
+
+        # Client-side PII scrubbing
+        if self.privacy.get("enabled", False):
+            payload = self._apply_privacy(payload)
+
+        # Client-side injection scanning
+        if self.enable_injection_scan:
+            injection = self._scan_injection(payload)
+            if injection["detected"]:
+                if not payload.get("metadata"):
+                    payload["metadata"] = {}
+                payload["metadata"]["injection_scan"] = injection
+
+        with self._buffer_lock:
+            self._buffer.append(payload)
+            logger.debug("Buffered trace %s (buffer size: %d)", payload.get("traceId"), len(self._buffer))
+
+        # If sync mode or buffer full, flush immediately
+        if not self.async_mode or len(self._buffer) >= self.batch_size:
+            self._do_flush(raise_quota_error=True)
+
+    def _do_flush(self, raise_quota_error: bool = False) -> None:
+        """Flush buffered traces to the API."""
+        with self._buffer_lock:
+            if not self._buffer:
+                return
+            batch = list(self._buffer)
+            self._buffer.clear()
+
+        # p3 — best-effort: attach signed agent credentials before sending.
+        if self.stamp_identity:
+            self._stamp_batch_identities(batch)
+
+        # Send in batches of batch_size
+        for i in range(0, len(batch), self.batch_size):
+            chunk = batch[i : i + self.batch_size]
+
+            # Route through OTel exporter when in OTLP mode
+            if self.mode == "otlp" and self._otel_exporter:
+                try:
+                    self._otel_exporter.export_traces(chunk)
+                    logger.debug("Exported %d traces via OTLP", len(chunk))
+                except Exception as e:
+                    logger.warning("Failed to export %d traces via OTLP: %s", len(chunk), e)
+                continue
+
+            retries = 0
+            while retries < 3:
+                try:
+                    self._request("POST", self._api_path("/traces/ingest"), json={"traces": chunk})
+                    logger.debug("Flushed %d traces", len(chunk))
+                    break
+                except QuotaExceededError as e:
+                    self._set_quota_exceeded(e)
+                    if raise_quota_error:
+                        raise
+                    logger.warning("Trace quota exceeded while flushing %d traces: %s", len(chunk), e)
+                    break
+                except ExeclaveError as e:
+                    retries += 1
+                    if retries >= 3:
+                        logger.warning("Failed to flush %d traces after 3 retries: %s", len(chunk), e)
+                    else:
+                        time.sleep(2 ** retries * 0.5)  # exponential backoff
+
+    def _stamp_batch_identities(self, batch: list[dict]) -> None:
+        """Attach a signed agent credential (exe_agt_) to each trace in the batch (p3).
+
+        Resolves one credential per unique agentId (cached by ``get_agent_credential``)
+        and stamps its token onto every trace for that agent. Best-effort: a failure to
+        issue a credential for an agent leaves that agent's traces unstamped and never
+        raises, so identity stamping can never block or drop trace ingestion.
+        """
+        agent_ids = {
+            t.get("agentId")
+            for t in batch
+            if t.get("agentId") and not t.get("agentCredential")
+        }
+        if not agent_ids:
+            return
+
+        tokens: dict[str, str] = {}
+        for agent_id in agent_ids:
+            try:
+                cred = self.get_agent_credential(agent_id)
+                token = cred.get("credential")
+                if token:
+                    tokens[agent_id] = token
+            except Exception as e:  # noqa: BLE001 — stamping must never break ingest
+                logger.debug("Identity stamping skipped for agent %s: %s", agent_id, e)
+
+        for trace in batch:
+            agent_id = trace.get("agentId")
+            if agent_id and not trace.get("agentCredential") and agent_id in tokens:
+                trace["agentCredential"] = tokens[agent_id]
+
+    def _flush_loop(self) -> None:
+        """Background thread: periodically flush the buffer."""
+        while self._state != _STATE_SHUTDOWN:
+            self._flush_event.wait(timeout=self.flush_interval_seconds)
+            if self._state == _STATE_SHUTDOWN:
+                break
+            self._do_flush()
+
+    def _connect_websocket(self) -> None:
+        """Connect to Socket.IO /sdk namespace for real-time agent control."""
+        try:
+            sio = _socketio_mod.Client(reconnection=True, reconnection_delay=2)  # type: ignore[union-attr]
+
+            @sio.on('agent.status_updated', namespace='/sdk')
+            def on_status_update(data: dict) -> None:
+                agent_id = data.get('agentId')
+                new_status = data.get('status')
+
+                if agent_id and agent_id in self._agents:
+                    agent = self._agents[agent_id]
+
+                    if new_status == 'paused' and self._state == _STATE_ACTIVE:
+                        self._state = _STATE_PAUSED
+                        agent.status = 'paused'
+                        self._flush_policy_cache()
+                        logger.warning(
+                            'Agent %s PAUSED via WebSocket kill switch (reason: %s)',
+                            agent_id, data.get('reason', 'none'),
+                        )
+                    elif new_status == 'active' and self._state == _STATE_PAUSED:
+                        self._state = _STATE_ACTIVE
+                        agent.status = 'active'
+                        logger.info('Agent %s RESUMED via WebSocket', agent_id)
+
+            @sio.event
+            def connect() -> None:
+                logger.info('WebSocket control channel connected')
+
+            @sio.event
+            def connect_error(data: Any) -> None:
+                logger.debug('WebSocket connect error: %s — falling back to HTTP polling', data)
+
+            # Connect in background thread
+            def _ws_connect() -> None:
+                try:
+                    sio.connect(
+                        self.base_url,
+                        namespaces=['/sdk'],
+                        auth={'apiKey': self.api_key},
+                        transports=['websocket'],
+                    )
+                except Exception as e:
+                    logger.debug('WebSocket connection failed: %s — HTTP polling continues', e)
+
+            ws_thread = threading.Thread(target=_ws_connect, daemon=True, name='Execlave-ws')
+            ws_thread.start()
+            self._sio = sio
+
+        except Exception as e:
+            logger.debug('WebSocket setup failed: %s — HTTP polling continues', e)
+
+    def _status_poll_loop(self) -> None:
+        """Background thread: poll agent status for kill-switch / control channel."""
+        while self._state != _STATE_SHUTDOWN:
+            time.sleep(self._poll_interval_seconds)
+            if self._state == _STATE_SHUTDOWN:
+                break
+            for agent_id, agent in list(self._agents.items()):
+                try:
+                    resp = self._request("GET", self._api_path(f"/agents/{agent.id}/status-poll"))
+                    data = resp.get("data", {})
+                    new_status = data.get("status", "active")
+
+                    if new_status == "paused" and self._state == _STATE_ACTIVE:
+                        self._state = _STATE_PAUSED
+                        agent.status = "paused"
+                        self._flush_policy_cache()
+                        logger.warning(
+                            "Agent %s has been PAUSED via kill switch", agent_id
+                        )
+                    elif new_status == "active" and self._state == _STATE_PAUSED:
+                        self._state = _STATE_ACTIVE
+                        agent.status = "active"
+                        logger.info("Agent %s has been RESUMED", agent_id)
+
+                    agent.status = new_status
+                except ExeclaveError:
+                    logger.debug("Status poll failed for agent %s", agent_id)
+                except Exception:
+                    logger.debug("Unexpected error polling agent %s", agent_id, exc_info=True)
+
+    def check_agent_status(self, agent_id: str | None = None) -> str:
+        """
+        Check the current status of a registered agent.
+
+        Returns 'active', 'paused', or 'error'.
+        """
+        agent = None
+        if agent_id and agent_id in self._agents:
+            agent = self._agents[agent_id]
+        elif self._agents:
+            agent = next(iter(self._agents.values()))
+
+        if not agent:
+            return "unknown"
+
+        try:
+            resp = self._request("GET", self._api_path(f"/agents/{agent.id}/status-poll"))
+            status = resp.get("data", {}).get("status", "active")
+            agent.status = status
+            return status
+        except ExeclaveError:
+            return "error"
+
+    # ------------------------------------------------------------------
+    # Privacy & Injection Scanning
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _hash_pii(value: str) -> str:
+        """SHA-256 hash a PII value for redacted storage."""
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+    @staticmethod
+    def _to_text(data: Any) -> str:
+        """Convert arbitrary data to searchable text."""
+        if data is None:
+            return ""
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            return " ".join(str(v) for v in data.values())
+        if isinstance(data, (list, tuple)):
+            return " ".join(str(v) for v in data)
+        return str(data)
+
+    @staticmethod
+    def _scrub_text(text: str) -> str:
+        """Replace PII in text with type-labeled placeholders."""
+        if not text:
+            return text or ""
+        result = text
+        for pii_type, pattern in _PII_PATTERNS.items():
+            result = pattern.sub(f"[{pii_type.upper()}_REDACTED]", result)
+        return result
+
+    def _apply_privacy(self, payload: dict) -> dict:
+        """
+        Scrub PII from input/output fields of a trace payload.
+
+        Privacy config:
+            privacy = {
+                "enabled": True,
+                "scrub_fields": ["input", "output"],  # fields to scrub
+                "hash_pii": True,  # include hashed PII in metadata
+            }
+        """
+        fields_to_scrub = self.privacy.get("scrub_fields", ["input", "output"])
+        hash_pii = self.privacy.get("hash_pii", True)
+
+        pii_summary: dict = {}
+
+        for field in fields_to_scrub:
+            value = payload.get(field)
+            if not value:
+                continue
+            text = self._to_text(value)
+            if not text:
+                continue
+
+            # Detect PII
+            for pii_type, pattern in _PII_PATTERNS.items():
+                matches = pattern.findall(text)
+                if matches:
+                    if pii_type not in pii_summary:
+                        pii_summary[pii_type] = {"count": 0, "hashes": []}
+                    pii_summary[pii_type]["count"] += len(matches)
+                    if hash_pii:
+                        pii_summary[pii_type]["hashes"].extend(
+                            self._hash_pii(m) for m in matches
+                        )
+
+            # Replace PII with placeholders
+            if isinstance(value, str):
+                payload[field] = self._scrub_text(value)
+            elif isinstance(value, dict):
+                payload[field] = {
+                    k: self._scrub_text(str(v)) if isinstance(v, str) else v
+                    for k, v in value.items()
+                }
+
+        if pii_summary:
+            if not payload.get("metadata"):
+                payload["metadata"] = {}
+            payload["metadata"]["pii_detected"] = pii_summary
+            payload["metadata"]["pii_scrubbed"] = True
+
+        return payload
+
+    def _scan_injection(self, payload: dict) -> dict:
+        """
+        Scan the input field for prompt injection patterns.
+
+        Returns: { "detected": bool, "risk_level": str, "patterns_matched": list }
+        """
+        text = self._to_text(payload.get("input"))
+        if not text:
+            return {"detected": False, "risk_level": "none", "patterns_matched": []}
+
+        matched: list[str] = []
+        for pattern in _INJECTION_PATTERNS:
+            if pattern.search(text):
+                matched.append(pattern.pattern)
+
+        count = len(matched)
+        if count == 0:
+            risk = "none"
+        elif count == 1:
+            risk = "low"
+        elif count <= 3:
+            risk = "medium"
+        elif count <= 5:
+            risk = "high"
+        else:
+            risk = "critical"
+
+        return {
+            "detected": count > 0,
+            "risk_level": risk,
+            "patterns_matched": matched,
+        }
+
+    # ------------------------------------------------------------------
+    # Backward compat — expose old methods
+    # ------------------------------------------------------------------
+
+    def _register_agent_compat(self, **kwargs) -> dict:
+        """Legacy method — returns raw dict instead of Agent object."""
+        agent = self.register_agent(**kwargs)
+        return agent._data
+
+
+# Backward-compatible alias
+ExeclaveClient = Execlave
+

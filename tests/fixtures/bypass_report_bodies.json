@@ -1,0 +1,131 @@
+{
+  "coalesced_window": [
+    {
+      "sdk": {
+        "language": "python",
+        "name": "execlave-sdk",
+        "version": "1.8.0"
+      },
+      "sentAt": "2026-09-21T12:00:22.500Z",
+      "windows": [
+        {
+          "agentId": "agent-1",
+          "consecutiveFailures": 3,
+          "count": 3,
+          "firstAt": "2026-09-21T12:00:00.000Z",
+          "lastAt": "2026-09-21T12:00:15.000Z",
+          "message": "down",
+          "reason": "circuit_breaker_open",
+          "source": "fail_open_circuit_breaker",
+          "windowId": "00000000-0000-4000-8000-000000000001"
+        }
+      ]
+    }
+  ],
+  "full_window": [
+    {
+      "sdk": {
+        "language": "python",
+        "name": "execlave-sdk",
+        "version": "1.8.0"
+      },
+      "sentAt": "2026-09-21T12:00:00.000Z",
+      "windows": [
+        {
+          "agentId": "agent-1",
+          "consecutiveFailures": 4,
+          "count": 1,
+          "firstAt": "2026-09-21T12:00:00.000Z",
+          "lastAt": "2026-09-21T12:00:00.000Z",
+          "message": "server error 503",
+          "reason": "server_error",
+          "source": "fail_open_server_error",
+          "status": 503,
+          "windowId": "00000000-0000-4000-8000-000000000001"
+        }
+      ]
+    }
+  ],
+  "loss_only": [
+    {
+      "dropped": {
+        "bypasses": 1,
+        "dropId": "00000000-0000-4000-8000-000000000002",
+        "since": "2026-09-21T12:00:00.000Z",
+        "windows": 1
+      },
+      "sdk": {
+        "language": "python",
+        "name": "execlave-sdk",
+        "version": "1.8.0"
+      },
+      "sentAt": "2026-09-21T12:00:00.000Z",
+      "windows": []
+    }
+  ],
+  "minimal_window": [
+    {
+      "sdk": {
+        "language": "python",
+        "name": "execlave-sdk",
+        "version": "1.8.0"
+      },
+      "sentAt": "2026-09-21T12:00:00.000Z",
+      "windows": [
+        {
+          "agentId": "a",
+          "count": 1,
+          "firstAt": "2026-09-21T12:00:00.000Z",
+          "lastAt": "2026-09-21T12:00:00.000Z",
+          "reason": "network_error",
+          "source": "fail_open_network_error",
+          "windowId": "00000000-0000-4000-8000-000000000001"
+        }
+      ]
+    }
+  ],
+  "oversized_fields_truncated": [
+    {
+      "sdk": {
+        "language": "python",
+        "name": "execlave-sdk",
+        "version": "1.8.0"
+      },
+      "sentAt": "2026-09-21T12:00:00.000Z",
+      "windows": [
+        {
+          "agentId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "count": 1,
+          "firstAt": "2026-09-21T12:00:00.000Z",
+          "lastAt": "2026-09-21T12:00:00.000Z",
+          "message": "\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00\ud83d\ude00",
+          "reason": "network_error",
+          "source": "ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+          "windowId": "00000000-0000-4000-8000-000000000001"
+        }
+      ]
+    }
+  ],
+  "unstorable_text_cleaned": [
+    {
+      "sdk": {
+        "language": "python",
+        "name": "execlave-sdk",
+        "version": "1.8.0"
+      },
+      "sentAt": "2026-09-21T12:00:00.000Z",
+      "windows": [
+        {
+          "agentId": "agent\ufffd",
+          "count": 1,
+          "firstAt": "2026-09-21T12:00:00.000Z",
+          "lastAt": "2026-09-21T12:00:00.000Z",
+          "message": "a\ufffdb\ud83d\ude00\ufffd",
+          "reason": "network_error",
+          "source": "fail_open_network_error",
+          "windowId": "00000000-0000-4000-8000-000000000001"
+        }
+      ]
+    }
+  ]
+}
