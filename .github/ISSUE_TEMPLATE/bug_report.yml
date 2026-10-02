@@ -1,0 +1,62 @@
+name: "Bug report"
+description: "Report a reproducible defect in execlave-sdk"
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Security issues: please email security@execlave.com instead.
+  - type: input
+    id: sdk-version
+    attributes:
+      label: "execlave-sdk version"
+      description: "Output of `pip show execlave-sdk | grep Version`"
+      placeholder: "1.1.0"
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: "Python version"
+      placeholder: "3.12.2"
+    validations:
+      required: true
+  - type: dropdown
+    id: integration
+    attributes:
+      label: "Integration in use (if any)"
+      options:
+        - "None (core SDK only)"
+        - "LangChain (ExeclaveCallbackHandler)"
+        - "OpenAI Agents SDK (ExeclaveTracingProcessor)"
+        - "CrewAI (instrument_crew)"
+        - "OpenTelemetry"
+        - "Other"
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: "Minimal reproduction"
+      description: "The smallest code sample that reproduces the issue. Redact API keys."
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Expected behaviour"
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Actual behaviour"
+      description: "Include full traceback if any."
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: "Additional context"
+      description: "OS, LLM provider, network constraints, etc."
